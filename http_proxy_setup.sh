@@ -1,102 +1,125 @@
-#!/bin/bash
+DEFAULT_START_PORT=30000                          # 默认起始端口
+DEFAULT_HTTP_USERNAME="userb"                    # 默认 HTTP 代理账号
+DEFAULT_HTTP_PASSWORD="passwordb"                # 默认 HTTP 代理密码
+DEFAULT_WS_PATH="/ws"                             # 默认 ws 路径
+DEFAULT_UUID=$(cat /proc/sys/kernel/random/uuid)  # 默认随机 UUID
 
-# =============================
-# HTTP Proxy 一键安装脚本 (3proxy)
-# 适用于 Debian/Ubuntu
-# 每个公网 IP 对应一个端口，支持自定义用户名密码
-# =============================
-# 用法: bash <(curl -fsSL URL) 用户名 密码 起始端口
+IP_ADDRESSES=($(hostname -I))
 
-# 检查参数
-if [ "$#" -ne 3 ]; then
-    echo -e "\e[91m[错误]\e[0m 用法: $0 用户名 密码 起始端口"
-    exit 1
-fi
-
-USERNAME=$1
-PASSWORD=$2
-PORT_START=$3
-
-# 检测系统类型
-if [[ -f /etc/debian_version ]]; then
-    OS="debian"
-else
-    echo -e "\e[91m[错误]\e[0m 不支持的系统，仅支持 Debian/Ubuntu"
-    exit 1
-fi
-
-# 更新软件源并安装必要软件
-apt update && apt install -y build-essential git iptables-persistent netfilter-persistent
-
-# 手动编译安装 3proxy
-cd /root
-git clone https://github.com/3proxy/3proxy.git
-cd 3proxy
-make -f Makefile.Linux
-
-# 安装 3proxy
-mkdir -p /usr/local/etc/3proxy
-cp src/3proxy /usr/local/bin/
-cp scripts/3proxy.service /etc/systemd/system/
-
-# 获取所有公网 IP
-IP_LIST=($(hostname -I | tr ' ' '\n' | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$"))
-
-# 配置 3proxy
-cat > /usr/local/etc/3proxy/3proxy.cfg <<EOF
-#!/usr/bin/3proxy
-
-# 启用 HTTP 代理
-auth strong
-users $USERNAME:CL:$PASSWORD
-
-EOF
-
-PORT=$PORT_START
-for IP in "${IP_LIST[@]}"; do
-    echo "proxy -n -a -p$PORT -i$IP -e$IP" >> /usr/local/etc/3proxy/3proxy.cfg
-    ((PORT++))
-done
-
-# 设置 3proxy 服务
-cat > /etc/systemd/system/3proxy.service <<EOF
+install_xray() {
+    echo "安装 Xray..."
+    apt-get install unzip -y || yum install unzip -y
+    wget https://github.com/XTLS/Xray-core/releases/download/v1.8.3/Xray-linux-64.zip
+    unzip Xray-linux-64.zip
+    mv xray /usr/local/bin/xrayL
+    chmod +x /usr/local/bin/xrayL
+    cat <<EOF >/etc/systemd/system/xrayL.service
 [Unit]
-Description=3proxy HTTP Proxy
+Description=XrayL Service
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
-Restart=always
+ExecStart=/usr/local/bin/xrayL -c /etc/xrayL/config.toml
+Restart=on-failure
+User=nobody
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload
+    systemctl enable xrayL.service
+    systemctl start xrayL.service
+    echo "Xray 安装完成."
+}
 
-# 启动服务并设置开机自启
-systemctl daemon-reload
-systemctl enable 3proxy
-systemctl restart 3proxy
+config_xray() {
+    config_type=$1
+    mkdir -p /etc/xrayL
+    if [ "$config_type" != "http" ] && [ "$config_type" != "vmess" ]; then
+        echo "类型错误！仅支持 http 和 vmess."
+        exit 1
+    fi
 
-# 配置防火墙规则
-if command -v ufw &>/dev/null; then
-    for ((i=0; i<${#IP_LIST[@]}; i++)); do
-        ufw allow $(($PORT_START + i))/tcp
+    read -p "起始端口 (默认 $DEFAULT_START_PORT): " START_PORT
+    START_PORT=${START_PORT:-$DEFAULT_START_PORT}
+
+    if [ "$config_type" == "http" ]; then
+        read -p "HTTP 账号 (默认 $DEFAULT_HTTP_USERNAME): " HTTP_USERNAME
+        HTTP_USERNAME=${HTTP_USERNAME:-$DEFAULT_HTTP_USERNAME}
+
+        read -p "HTTP 密码 (默认 $DEFAULT_HTTP_PASSWORD): " HTTP_PASSWORD
+        HTTP_PASSWORD=${HTTP_PASSWORD:-$DEFAULT_HTTP_PASSWORD}
+    elif [ "$config_type" == "vmess" ]; then
+        read -p "UUID (默认随机): " UUID
+        UUID=${UUID:-$DEFAULT_UUID}
+        read -p "WebSocket 路径 (默认 $DEFAULT_WS_PATH): " WS_PATH
+        WS_PATH=${WS_PATH:-$DEFAULT_WS_PATH}
+    fi
+
+    for ((i = 0; i < ${#IP_ADDRESSES[@]}; i++)); do
+        config_content+="[[inbounds]]\n"
+        config_content+="port = $((START_PORT + i))\n"
+        config_content+="protocol = \"$config_type\"\n"
+        config_content+="tag = \"tag_$((i + 1))\"\n"
+        config_content+="[inbounds.settings]\n"
+        
+        if [ "$config_type" == "http" ]; then
+            config_content+="auth = \"password\"\n"
+            config_content+="ip = \"${IP_ADDRESSES[i]}\"\n"
+            config_content+="[[inbounds.settings.accounts]]\n"
+            config_content+="user = \"$HTTP_USERNAME\"\n"
+            config_content+="pass = \"$HTTP_PASSWORD\"\n"
+        elif [ "$config_type" == "vmess" ]; then
+            config_content+="[[inbounds.settings.clients]]\n"
+            config_content+="id = \"$UUID\"\n"
+            config_content+="[inbounds.streamSettings]\n"
+            config_content+="network = \"ws\"\n"
+            config_content+="[inbounds.streamSettings.wsSettings]\n"
+            config_content+="path = \"$WS_PATH\"\n\n"
+        fi
+        
+        config_content+="[[outbounds]]\n"
+        config_content+="sendThrough = \"${IP_ADDRESSES[i]}\"\n"
+        config_content+="protocol = \"freedom\"\n"
+        config_content+="tag = \"tag_$((i + 1))\"\n\n"
+        config_content+="[[routing.rules]]\n"
+        config_content+="type = \"field\"\n"
+        config_content+="inboundTag = \"tag_$((i + 1))\"\n"
+        config_content+="outboundTag = \"tag_$((i + 1))\"\n\n\n"
     done
-elif command -v iptables &>/dev/null; then
-    for ((i=0; i<${#IP_LIST[@]}; i++)); do
-        iptables -I INPUT -p tcp --dport $(($PORT_START + i)) -j ACCEPT
-    done
-    iptables-save > /etc/iptables.rules
-    netfilter-persistent save
-    netfilter-persistent reload
-fi
+    echo -e "$config_content" >/etc/xrayL/config.toml
+    systemctl restart xrayL.service
+    systemctl --no-pager status xrayL.service
+    echo ""
+    echo "生成 $config_type 配置完成"
+    echo "起始端口:$START_PORT"
+    echo "结束端口:$(($START_PORT + $i - 1))"
+    if [ "$config_type" == "http" ]; then
+        echo "HTTP 代理账号:$HTTP_USERNAME"
+        echo "HTTP 代理密码:$HTTP_PASSWORD"
+    elif [ "$config_type" == "vmess" ]; then
+        echo "UUID:$UUID"
+        echo "WebSocket 路径:$WS_PATH"
+    fi
+    echo ""
+}
 
-# 输出代理信息
-echo -e "\e[92m[完成] HTTP 代理安装成功！\e[0m"
-echo "====================================="
-PORT=$PORT_START
-for IP in "${IP_LIST[@]}"; do
-    echo "HTTP 代理地址: http://$USERNAME:$PASSWORD@$IP:$PORT"
-    ((PORT++))
-done
-echo "====================================="
+main() {
+    [ -x "$(command -v xrayL)" ] || install_xray
+    if [ $# -eq 1 ]; then
+        config_type="$1"
+    else
+        read -p "选择生成的节点类型 (http/vmess): " config_type
+    fi
+    if [ "$config_type" == "vmess" ]; then
+        config_xray "vmess"
+    elif [ "$config_type" == "http" ]; then
+        config_xray "http"
+    else
+        echo "未正确选择类型，默认使用 HTTP 配置."
+        config_xray "http"
+    fi
+}
+
+main "$@"
