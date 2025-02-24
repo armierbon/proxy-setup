@@ -1,65 +1,54 @@
 #!/bin/bash
 
-# 颜色
-GREEN="\033[32m"
-RED="\033[31m"
-RESET="\033[0m"
+# 获取用户输入的参数（用户名、密码、端口）
+USER=${1:-"proxyuser"}
+PASS=${2:-"proxypass"}
+PORT=${3:-30000}
 
-# 检查 root 权限
+# 检查是否为 root 用户
 if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}请使用 root 用户运行此脚本！${RESET}"
-   exit 1
-fi
-
-# 交互式输入用户名、密码、端口
-read -p "请输入代理用户名: " USER
-read -s -p "请输入代理密码: " PASS
-echo ""
-read -p "请输入起始端口号 (默认 30000): " START_PORT
-START_PORT=${START_PORT:-30000}
-
-# 获取 VPS 的所有公网 IPv4 地址
-IP_LIST=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1)
-
-echo -e "${GREEN}正在安装 3proxy...${RESET}"
-
-# 安装必要组件
-if [[ -f /etc/debian_version ]]; then
-    apt update -y && apt install -y build-essential wget tar
-elif [[ -f /etc/redhat-release ]]; then
-    yum install -y gcc make wget tar
-else
-    echo -e "${RED}不支持的操作系统${RESET}"
+    echo "请使用 root 用户运行此脚本！"
     exit 1
 fi
 
-# 下载并编译 3proxy
+echo "🔹 开始安装 3proxy 并配置 HTTP 代理..."
+echo "🔹 用户名: $USER"
+echo "🔹 密码: $PASS"
+echo "🔹 端口: $PORT"
+
+# 更新系统并安装必要的软件
+apt update -y && apt install -y curl wget tar make gcc build-essential
+
+# 下载 3proxy 并编译
 cd /root
-wget -qO 3proxy.tar.gz https://github.com/z3APA3A/3proxy/archive/refs/tags/0.9.4.tar.gz
-tar -xzf 3proxy.tar.gz
+wget -qO- https://github.com/z3APA3A/3proxy/archive/refs/tags/0.9.4.tar.gz | tar xz
 cd 3proxy-0.9.4
 make -f Makefile.Linux
+mkdir -p /usr/local/bin /usr/local/etc/3proxy
 cp bin/3proxy /usr/local/bin/
-chmod +x /usr/local/bin/3proxy
 
-# 配置 3proxy
-mkdir -p /usr/local/etc/3proxy
+# 获取所有可用 IP（IPv4）
+IP_LIST=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1')
+
+# 生成 3proxy 配置文件
 cat > /usr/local/etc/3proxy/3proxy.cfg <<EOF
-daemon
 auth strong
-users ${USER}:CL:${PASS}
+users $USER:CL:$PASS
+allow $USER
 EOF
 
-PORT=$START_PORT
+# 为每个 IP 绑定一个端口
+PORT_START=$PORT
 for IP in $IP_LIST; do
-    echo "proxy -n -a -p${PORT} -i${IP} -e${IP}" >> /usr/local/etc/3proxy/3proxy.cfg
-    PORT=$((PORT + 1))
+    echo "proxy -n -a -p$PORT_START -i$IP -e$IP" >> /usr/local/etc/3proxy/3proxy.cfg
+    echo "🔹 代理绑定: $IP:$PORT_START"
+    PORT_START=$((PORT_START+1))
 done
 
-# 创建 systemd 服务
+# 配置 systemd 服务
 cat > /etc/systemd/system/3proxy.service <<EOF
 [Unit]
-Description=3Proxy Proxy Server
+Description=3proxy Proxy Server
 After=network.target
 
 [Service]
@@ -71,17 +60,21 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-# 启动 3proxy
+# 重新加载 systemd 并启动 3proxy
 systemctl daemon-reload
 systemctl enable 3proxy
 systemctl restart 3proxy
 
-# 显示代理信息
-echo -e "${GREEN}HTTP 代理已安装并运行！${RESET}"
-echo "============================="
-PORT=$START_PORT
-for IP in $IP_LIST; do
-    echo "http://${USER}:${PASS}@${IP}:${PORT}"
-    PORT=$((PORT + 1))
+# 开放防火墙端口
+for (( i=$PORT; i<$PORT_START; i++ )); do
+    ufw allow $i/tcp
 done
-echo "============================="
+ufw reload
+
+echo "✅ HTTP 代理安装完成！"
+echo "📌 代理地址:"
+PORT_START=$PORT
+for IP in $IP_LIST; do
+    echo "🔹 http://$USER:$PASS@$IP:$PORT_START"
+    PORT_START=$((PORT_START+1))
+done
