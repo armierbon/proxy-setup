@@ -1,80 +1,85 @@
 #!/bin/bash
 
-# 获取用户输入的参数（用户名、密码、端口）
-USER=${1:-"proxyuser"}
-PASS=${2:-"proxypass"}
-PORT=${3:-30000}
+# =============================
+# HTTP Proxy 一键安装脚本 (3proxy)
+# =============================
+# 用法: bash <(curl -fsSLk URL) 用户名 密码 端口
 
-# 检查是否为 root 用户
-if [[ $EUID -ne 0 ]]; then
-    echo "请使用 root 用户运行此脚本！"
+# 检查参数
+if [ "$#" -ne 3 ]; then
+    echo "\e[91m[错误]\e[0m 用法: $0 用户名 密码 端口"
     exit 1
 fi
 
-echo "🔹 开始安装 3proxy 并配置 HTTP 代理..."
-echo "🔹 用户名: $USER"
-echo "🔹 密码: $PASS"
-echo "🔹 端口: $PORT"
+USERNAME=$1
+PASSWORD=$2
+PORT=$3
 
-# 更新系统并安装必要的软件
-apt update -y && apt install -y curl wget tar make gcc build-essential
+# 检测系统类型
+if [[ -f /etc/debian_version ]]; then
+    OS="debian"
+elif [[ -f /etc/redhat-release ]]; then
+    OS="centos"
+else
+    echo "\e[91m[错误]\e[0m 不支持的系统"
+    exit 1
+fi
 
-# 下载 3proxy 并编译
-cd /root
-wget -qO- https://github.com/z3APA3A/3proxy/archive/refs/tags/0.9.4.tar.gz | tar xz
-cd 3proxy-0.9.4
-make -f Makefile.Linux
-mkdir -p /usr/local/bin /usr/local/etc/3proxy
-cp bin/3proxy /usr/local/bin/
+# 安装必要软件
+if [[ "$OS" == "debian" ]]; then
+    apt update && apt install -y 3proxy
+elif [[ "$OS" == "centos" ]]; then
+    yum install -y epel-release && yum install -y 3proxy
+fi
 
-# 获取所有可用 IP（IPv4）
-IP_LIST=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1')
+# 获取所有公网 IP
+IP_LIST=$(hostname -I | tr ' ' '\n' | grep -E "^[0-9]+").
 
-# 生成 3proxy 配置文件
-cat > /usr/local/etc/3proxy/3proxy.cfg <<EOF
+# 配置 3proxy
+mkdir -p /etc/3proxy
+cat > /etc/3proxy/3proxy.cfg <<EOF
+#!/usr/bin/3proxy
+
+# 启用 HTTP 代理
 auth strong
-users $USER:CL:$PASS
-allow $USER
+users $USERNAME:CL:$PASSWORD
+
+$(for IP in $IP_LIST; do
+    echo "proxy -n -a -p$PORT -i$IP -e$IP"
+done)
 EOF
 
-# 为每个 IP 绑定一个端口
-PORT_START=$PORT
-for IP in $IP_LIST; do
-    echo "proxy -n -a -p$PORT_START -i$IP -e$IP" >> /usr/local/etc/3proxy/3proxy.cfg
-    echo "🔹 代理绑定: $IP:$PORT_START"
-    PORT_START=$((PORT_START+1))
-done
-
-# 配置 systemd 服务
+# 设置 3proxy 服务
 cat > /etc/systemd/system/3proxy.service <<EOF
 [Unit]
-Description=3proxy Proxy Server
+Description=3proxy HTTP Proxy
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/3proxy /usr/local/etc/3proxy/3proxy.cfg
+ExecStart=/usr/bin/3proxy /etc/3proxy/3proxy.cfg
 Restart=always
-User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 重新加载 systemd 并启动 3proxy
+# 启动服务并设置开机自启
 systemctl daemon-reload
 systemctl enable 3proxy
 systemctl restart 3proxy
 
-# 开放防火墙端口
-for (( i=$PORT; i<$PORT_START; i++ )); do
-    ufw allow $i/tcp
-done
-ufw reload
+# 配置防火墙
+if command -v ufw &>/dev/null; then
+    ufw allow $PORT/tcp
+elif command -v iptables &>/dev/null; then
+    iptables -I INPUT -p tcp --dport $PORT -j ACCEPT
+    iptables-save > /etc/iptables.rules
+fi
 
-echo "✅ HTTP 代理安装完成！"
-echo "📌 代理地址:"
-PORT_START=$PORT
+# 输出代理信息
+echo "\e[92m[完成] HTTP 代理安装成功！\e[0m"
+echo "====================================="
 for IP in $IP_LIST; do
-    echo "🔹 http://$USER:$PASS@$IP:$PORT_START"
-    PORT_START=$((PORT_START+1))
+    echo "HTTP 代理地址: http://$USERNAME:$PASSWORD@$IP:$PORT"
 done
+echo "====================================="
