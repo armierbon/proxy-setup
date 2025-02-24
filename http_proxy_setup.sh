@@ -7,7 +7,7 @@
 
 # 检查参数
 if [ "$#" -ne 3 ]; then
-    echo -e "\e[91m[错误]\e[0m 用法: $0 用户名 密码 端口"
+    echo "\e[91m[错误]\e[0m 用法: $0 用户名 密码 端口"
     exit 1
 fi
 
@@ -21,33 +21,53 @@ if [[ -f /etc/debian_version ]]; then
 elif [[ -f /etc/redhat-release ]]; then
     OS="centos"
 else
-    echo -e "\e[91m[错误]\e[0m 不支持的系统"
+    echo "\e[91m[错误]\e[0m 不支持的系统"
     exit 1
 fi
 
-# 安装 3proxy
+# 安装必要软件
 if [[ "$OS" == "debian" ]]; then
-    apt update && apt install -y 3proxy iptables-persistent
+    apt update
+    apt install -y build-essential git iptables-persistent netfilter-persistent
+    cd /root
+    git clone https://github.com/3proxy/3proxy.git
+    cd 3proxy
+    make -f Makefile.Linux
+    mkdir -p /usr/local/etc/3proxy
+    cp src/3proxy /usr/local/bin/
+    cp scripts/3proxy.service /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable 3proxy
+    systemctl restart 3proxy
 elif [[ "$OS" == "centos" ]]; then
-    yum install -y epel-release && yum install -y 3proxy
+    yum install -y epel-release
+    yum install -y gcc make git
+    cd /root
+    git clone https://github.com/3proxy/3proxy.git
+    cd 3proxy
+    make -f Makefile.Linux
+    mkdir -p /usr/local/etc/3proxy
+    cp src/3proxy /usr/local/bin/
+    cp scripts/3proxy.service /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable 3proxy
+    systemctl restart 3proxy
 fi
 
 # 获取所有公网 IP
-IP_LIST=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1')
+IP_LIST=$(hostname -I | tr ' ' '\n' | grep -E "^[0-9]+")
 
 # 配置 3proxy
-mkdir -p /etc/3proxy
 cat > /etc/3proxy/3proxy.cfg <<EOF
 #!/usr/bin/3proxy
 
-# 启用 HTTP 代理
 auth strong
 users $USERNAME:CL:$PASSWORD
-EOF
 
-for IP in $IP_LIST; do
-    echo "proxy -n -a -p$PORT -i$IP -e$IP" >> /etc/3proxy/3proxy.cfg
-done
+$(for IP in $IP_LIST; do
+    echo "proxy -n -a -p$PORT -i$IP -e$IP"
+done)
+EOF
 
 # 设置 3proxy 服务
 cat > /etc/systemd/system/3proxy.service <<EOF
@@ -56,14 +76,14 @@ Description=3proxy HTTP Proxy
 After=network.target
 
 [Service]
-ExecStart=/usr/sbin/3proxy /etc/3proxy/3proxy.cfg
+ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 启动服务并设置开机自启
+# 启动服务
 systemctl daemon-reload
 systemctl enable 3proxy
 systemctl restart 3proxy
@@ -74,11 +94,14 @@ if command -v ufw &>/dev/null; then
 elif command -v iptables &>/dev/null; then
     iptables -I INPUT -p tcp --dport $PORT -j ACCEPT
     iptables-save > /etc/iptables.rules
-    netfilter-persistent save
 fi
 
+# 保存防火墙规则（解决 `netfilter-persistent` 问题）
+netfilter-persistent save
+netfilter-persistent reload
+
 # 输出代理信息
-echo -e "\e[92m[完成] HTTP 代理安装成功！\e[0m"
+echo "\e[92m[完成] HTTP 代理安装成功！\e[0m"
 echo "====================================="
 for IP in $IP_LIST; do
     echo "HTTP 代理地址: http://$USERNAME:$PASSWORD@$IP:$PORT"
